@@ -4,7 +4,7 @@ Primeira versão com painel administrativo e página de pagamento por cartão de
 
 ## Executar localmente
 
-1. Instale Node.js 24 ou superior e execute `npm ci`.
+1. Instale Node.js 24 ou superior e Python 3.11 ou superior. Execute `npm ci` e `python -m pip install -r requirements.txt`. O gerador de PDF usa ReportLab. Se necessário, configure `PYTHON_BIN` com o caminho do Python no servidor.
 2. Copie `.env.example` para `.env`.
 3. Configure `ADMIN_PASSWORD` com uma senha exclusiva de pelo menos 16 caracteres.
 4. Execute `npm start` e abra http://localhost:3000.
@@ -42,7 +42,7 @@ Esta entrega é uma base funcional local, ainda não homologada com a conta da O
 4. Rode uma única instância, com volume persistente para `data/`, backups protegidos e acesso restrito. Por padrão escuta apenas em 127.0.0.1; para container use `HOST=0.0.0.0` atrás de um proxy HTTPS.
 5. Configure limites de tráfego no proxy. O aplicativo não confia automaticamente em X-Forwarded-For; atrás de proxy seus limites internos poderão ser compartilhados por todos os visitantes.
 6. Revise os requisitos de segurança/compliance e antifraude da Cielo para o estabelecimento. SOP reduz o tráfego de dados sensíveis no servidor, mas não constitui certificação PCI da página. 3DS/antifraude não estão implementados.
-7. Preencha identificação jurídica, contato e política de privacidade da ONG antes de publicar para doadores. Esses dados não foram fornecidos.
+7. Revise a identificação jurídica, contato e política de privacidade antes de publicar. O PDF usa o nome, endereço e telefone do Instituto presentes no modelo enviado; CNPJ e política de privacidade ainda precisam ser informados.
 
 **Conciliação:** clique em “Consultar Cielo” no painel para atualizar o pagamento, inclusive estornos e cancelamentos feitos na Cielo. A página do doador mostra o último status persistido, não consulta diretamente a adquirente. Não há webhook nem rotina automática nesta versão. Nunca recrie uma cobrança em conferência sem verificar o pedido na Cielo. Pagamentos recusados exigem novo link; não há retentativa automática. As consultas da Cielo têm janela de três meses.
 
@@ -64,7 +64,7 @@ Referências consultadas em 28/09/2026.
 
 ## Pagamento em outras moedas (DCC)
 
-O valor da cobrança e os totais da organização continuam em **BRL**. Para cartões estrangeiros elegíveis Visa/Mastercard à vista, a Cielo pode oferecer a moeda local do cartão (por exemplo USD, EUR ou GBP). O doador escolhe entre BRL e a oferta retornada; não é uma lista livre para cobrar arbitrariamente em qualquer moeda.
+O valor enviado à Cielo e os totais de referência da organização continuam em **BRL**. A moeda do documento agora é escolhida na criação, como descrito abaixo. O fluxo DCC desta seção se aplica apenas a faturas emitidas em BRL. Para cartões estrangeiros elegíveis Visa/Mastercard à vista, a Cielo pode oferecer a moeda local do cartão (por exemplo USD, EUR ou GBP). O doador escolhe entre BRL e a oferta retornada; não é uma lista livre para cobrar arbitrariamente em qualquer moeda.
 
 - A página usa a moeda, o valor convertido e o câmbio retornados pela Cielo. Nenhuma cotação externa é usada em pagamentos reais.
 - Nenhuma opção vem pré-selecionada. A tela informa valor em BRL, valor estrangeiro, câmbio, markup e vencimento da oferta. O markup documentado pela Cielo na consulta é de 16%, configurável em `CIELO_DCC_MARKUP_PERCENT` e preservado junto à oferta.
@@ -111,3 +111,20 @@ Referências: https://github.com/Blockstream/esplora/blob/master/API.md e https:
 Débito ainda não está implementado. Exige autenticação 3DS; não basta mudar `CreditCard` para `DebitCard`. A integração precisa das credenciais 3DS, do código do estabelecimento (EC), do nome cadastrado e do MCC para gerar o token, além da etapa de autenticação no navegador e validação do resultado na autorização. O número de usuário do portal não deve ser presumido como EC. O conversor de moedas não se aplica ao débito.
 
 Referências: https://docs.cielo.com.br/ecommerce-cielo/docs/cart%C3%A3o-de-debito e https://docs.cielo.com.br/ecommerce-cielo/v3.0-en/docs/create-access-token.
+
+## Moeda escolhida na criação e fatura PDF
+
+O formulário permite escolher a moeda **antes de emitir a fatura**. O catálogo inclui as moedas ISO reconhecidas pelo runtime e Bitcoin. Essa é a moeda do documento, não uma declaração de que a Cielo liquida em todas elas.
+
+- Moeda, valor em unidades mínimas, precisão, endereço do doador e número sequencial `EV-000001` são persistidos. Faturas antigas são migradas para BRL sem mudar os valores existentes.
+- Para moeda diferente de BRL, o administrador informa também o equivalente fixo em reais. Não há câmbio automático. A página e o PDF mostram os dois valores claramente; apenas o equivalente BRL é enviado para a Cielo. Os limites atuais de pagamento em reais permanecem R$ 1 a R$ 100.000.
+- A escolha documental não força o DCC nem garante uma cobrança nativa em dólar/euro. Para faturas estrangeiras, o fluxo não oferece nova escolha DCC. Cobrança nativa e liquidação em moeda estrangeira exigiriam outro arranjo/provedor compatível.
+- Em BTC, o valor principal também define o valor da alternativa Bitcoin; o equivalente em BRL serve para cartão e totais de referência.
+- O botão **Baixar PDF** fica disponível ao finalizar a criação, na lista e na página de pagamento. O PDF contém número da fatura, emissão, vencimento, descrição, moeda, total, situação e QR Code para o link exclusivo `/p/:id`. Não aponta para uma página genérica de doação.
+- O PDF administrativo contém os dados do destinatário. O download pelo link público omite nome, e-mail e endereço do doador, preservando a mesma separação de dados da API pública.
+- Nome, endereço e telefone institucionais foram extraídos do PDF de referência fornecido pelo usuário. Não foram copiados os dados do pagador nem o valor daquela fatura.
+- `PUBLIC_URL` define o destino do QR Code. Em localhost, o PDF avisa que o link só funciona na própria máquina. Para enviar a terceiros, publique em HTTPS e configure a URL pública antes de gerar o PDF.
+- PDFs são gerados sob demanda, sem gravar dados pessoais em arquivos de cache; no máximo três renderizações simultâneas, com tempo e tamanho limitados. O servidor usa Python com ReportLab via entrada padrão, sem interpolar dados em comandos.
+- O comprovante de pagamento anterior e a fatura são documentos distintos: a fatura pode ser emitida antes do pagamento. Não é nota fiscal.
+
+O modelo visual foi conferido em PNG e o conteúdo do QR Code foi decodificado após renderizar o PDF. Testes cobrem valores EUR/JPY/KWD/BTC, conservação do equivalente BRL e acesso aos downloads.

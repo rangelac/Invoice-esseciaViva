@@ -7,3 +7,6 @@ playwright-report/
 test-results/
 *.log
 .preview/
+output/
+tmp/
+__pycache__/

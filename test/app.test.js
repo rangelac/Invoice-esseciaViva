@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {createApp, amountInCents, paymentState} from '../server.js';
 import {cieloClient} from '../cielo.js';
+import {invoiceValue} from '../invoice-money.js';
 import {bech32m} from 'bech32';
 import {validBitcoinAddress,satoshis,verifyBitcoin} from '../bitcoin.js';
 import {readQuote} from '../currency.js';
@@ -68,7 +69,7 @@ test('adaptador DCC solicita conversão e confirma com booleano, sem receber câ
  const requests=[];const client=cieloClient({PAYMENT_MODE:'production'},async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>({})};});await client.create({order_id:'abc',name:'Doador',amount:10000,dcc_requested:1},'token','Visa');assert.equal(JSON.parse(requests[0].options.body).Payment.DynamicCurrencyConversion,true);await client.confirm('id',false);assert.equal(requests[1].url,'https://api.cieloecommerce.cielo.com.br/1/sales/id/confirm');assert.deepEqual(JSON.parse(requests[1].options.body),{CurrencyConversion:false});
 });
 
-test('moeda de cobrança não pode ser alterada para simular suporte estrangeiro',async t=>{const f=await fixture(t);assert.equal((await f.create({currency:'USD'})).response.status,400);});
+test('fatura estrangeira exige equivalente em BRL explícito',async t=>{const f=await fixture(t);assert.equal((await f.create({currency:'USD'})).response.status,400);});
 test('conferência de cotação expirada consulta a Cielo sem renovar oferta',async t=>{
  const provider=dccProvider();const f=await fixture(t,provider,'sandbox',{CIELO_DCC_ENABLED:'true'});const {invoice}=await f.create();await f.request(`/api/public/${invoice.id}/pay`,{paymentToken:randomUUID(),brand:'Visa'});const row=f.db.prepare('SELECT quote_json FROM invoices WHERE id=?').get(invoice.id);const quote=JSON.parse(row.quote_json);quote.expiresAt='2020-01-01T00:00:00Z';f.db.prepare('UPDATE invoices SET quote_json=? WHERE id=?').run(JSON.stringify(quote),invoice.id);const result=await (await f.request(`/api/invoices/${invoice.id}/refresh`,{})).json();assert.equal(result.state,'paid');assert.equal(result.quote.expiresAt,'2020-01-01T00:00:00Z');assert.equal(provider.confirmations.length,0);
 });
@@ -98,3 +99,12 @@ test('Bitcoin produção emite QR e só confirma após verificação da rede e d
  const {invoice}=await f.create({bitcoinAmount:'0.0001'});const selected=await (await f.request(`/api/public/${invoice.id}/bitcoin`,{})).json();assert.equal(selected.address,btcAddress);assert.match(selected.qr,/^data:image\/png;base64,/);assert.equal(selected.uri,`bitcoin:${btcAddress}?amount=0.00010000&label=Essencia%20Viva`);
  const paid=await (await f.request(`/api/invoices/${invoice.id}/bitcoin-confirm`,{txid,vout:0,verifiedWithDonor:true})).json();assert.equal(paid.state,'paid');assert.equal(paid.bitcoinTxid,txid);
 });
+
+test('fatura conserva moeda e valor originais e cobra apenas o equivalente BRL',async t=>{
+ const f=await fixture(t);const {response,invoice}=await f.create({currency:'EUR',amount:'100.25',equivalentBrl:'601.50',billingAddress:'Rua Exemplo, 10\nLisboa, Portugal'});assert.equal(response.status,201);assert.equal(invoice.invoiceCurrency,'EUR');assert.equal(invoice.invoiceAmount,10025);assert.equal(invoice.amount,60150);assert.match(invoice.number,/^EV-[0-9]+$/);assert.equal(invoice.dccEnabled,false);
+ const pub=await (await f.request('/api/public/'+invoice.id)).json();assert.equal(pub.invoiceCurrency,'EUR');assert.equal(pub.billingAddress,undefined);assert.equal(pub.name,undefined);assert.equal((await f.request(`/api/public/${invoice.id}/pay`,{demo:true,demoCurrency:'EUR'})).status,400);
+ assert.equal((await (await f.request(`/api/public/${invoice.id}/pay`,{demo:true})).json()).state,'paid');
+});
+test('precisão por moeda, incluindo zero, três e oito casas',()=>{assert.deepEqual(invoiceValue('1200','JPY'),{minor:1200,digits:0});assert.deepEqual(invoiceValue('1.234','KWD'),{minor:1234,digits:3});assert.deepEqual(invoiceValue('0.00001001','BTC'),{minor:1001,digits:8});assert.throws(()=>invoiceValue('12.50','JPY'));assert.throws(()=>invoiceValue('0.001','EUR'));assert.throws(()=>invoiceValue('100','INVALID'));});
+test('fatura BTC define valor principal e mantém equivalente para cartão',async t=>{const f=await fixture(t);const {invoice}=await f.create({currency:'BTC',amount:'0.0001',equivalentBrl:'50.00'});assert.equal(invoice.invoiceAmount,10000);assert.equal(invoice.bitcoinAmount,10000);assert.equal(invoice.amount,5000);assert.equal(invoice.invoiceDigits,8);});
+test('PDF está disponível na emissão, com autenticação na versão completa',async t=>{const f=await fixture(t);const {invoice}=await f.create({currency:'USD',amount:'100',equivalentBrl:'500'});const path=`/api/invoices/${invoice.id}/pdf`;assert.equal((await fetch(f.base+path)).status,401);const pdf=await f.request(path);assert.equal(pdf.status,200);assert.equal(pdf.headers.get('content-type'),'application/pdf');assert.match(pdf.headers.get('content-disposition'),/Fatura-EV-/);assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0,5).toString(),'%PDF-');assert.equal((await f.request(`/api/public/${invoice.id}/pdf`)).status,200);});

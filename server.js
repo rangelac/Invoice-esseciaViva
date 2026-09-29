@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { cieloClient } from './cielo.js';
 import { readQuote, demoQuote } from './currency.js';
 import {installBitcoin,satoshis} from './bitcoin.js';
+import {currencies,invoiceValue} from './invoice-money.js';
+import {renderInvoicePdf} from './invoice-pdf.js';
 const root = dirname(fileURLToPath(import.meta.url));
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function amountInCents(value) {
@@ -41,9 +43,10 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
     CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, order_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, description TEXT NOT NULL, amount INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open', payment_id TEXT, checked_at TEXT);
   `);
   const columns=db.prepare('PRAGMA table_info(invoices)').all().map(c=>c.name);
-  for(const [column,type] of Object.entries({dcc_requested:'INTEGER NOT NULL DEFAULT 0',dcc_started_at:'TEXT',quote_json:'TEXT',choice_currency:'TEXT',choice_at:'TEXT'})) {
+  for(const [column,type] of Object.entries({dcc_requested:'INTEGER NOT NULL DEFAULT 0',dcc_started_at:'TEXT',quote_json:'TEXT',choice_currency:'TEXT',choice_at:'TEXT',invoice_currency:"TEXT NOT NULL DEFAULT 'BRL'",invoice_minor:'INTEGER',invoice_digits:'INTEGER NOT NULL DEFAULT 2',invoice_number:'TEXT',billing_address:"TEXT NOT NULL DEFAULT ''"})) {
     if(!columns.includes(column)) db.exec(`ALTER TABLE invoices ADD COLUMN ${column} ${type}`);
   }
+  db.exec("UPDATE invoices SET invoice_minor=amount WHERE invoice_minor IS NULL; UPDATE invoices SET invoice_number=printf('EV-%06d',rowid) WHERE invoice_number IS NULL");
   // A process restart must never unlock an attempt whose result is unknown.
   db.exec("UPDATE invoices SET state='review' WHERE state='processing'");
   const sessions=new Map();
@@ -65,7 +68,7 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
     const quote=row.quote_json?JSON.parse(row.quote_json):null;
     const quoteExpired=row.state==='currency_choice' && quote && Date.parse(quote.expiresAt)<=Date.now();
     const state=quoteExpired?'quote_expired':row.state==='open' && Date.parse(row.expires_at)<Date.now()?'expired':row.state;
-    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,bitcoinEnabled:bitcoin.enabled,bitcoinAmount:row.btc_sats || null,paymentMethod:row.payment_method,currency:'BRL',dccEnabled,quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,bitcoinTxid:row.btc_txid,bitcoinVout:row.btc_vout,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
+    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,bitcoinEnabled:bitcoin.enabled,bitcoinAmount:row.btc_sats || null,paymentMethod:row.payment_method,currency:'BRL',invoiceCurrency:row.invoice_currency,invoiceAmount:row.invoice_minor,invoiceDigits:row.invoice_digits,number:row.invoice_number,pdfUrl:`${origin}/api/public/${row.id}/pdf`,dccEnabled:dccEnabled && row.invoice_currency==='BRL',quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,billingAddress:row.billing_address,bitcoinTxid:row.btc_txid,bitcoinVout:row.btc_vout,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
   }
   function available(row) { return row && row.state==='open' && Date.parse(row.expires_at)>Date.now(); }
   app.post('/api/login',rateLimit({windowMs:15*60000,limit:10,skipSuccessfulRequests:true}), (req,res)=>{
@@ -77,11 +80,13 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
     res.json({ok:true});
   });
   app.post('/api/logout',auth,(req,res)=>{sessions.delete(req.sessionId);res.setHeader('Set-Cookie','ev_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');res.json({ok:true});});
-  app.get('/api/invoices',auth,(req,res)=>res.json({mode,invoices:db.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all().map(r=>exposed(r,true))}));
+  app.get('/api/invoices',auth,(req,res)=>res.json({mode,currencies,invoices:db.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all().map(r=>exposed(r,true))}));
   app.post('/api/invoices',auth,(req,res)=>{
     try {
-      const {name,email='',description,amount,dueDate,requestKey,currency='BRL',bitcoinAmount=''}=req.body || {};
-      if(currency!=='BRL') throw new Error('A cobrança é criada em BRL. A moeda do cartão é escolhida pelo doador após a oferta de conversão da Cielo.');
+      const {name,email='',description,amount,dueDate,requestKey,currency='BRL',bitcoinAmount='',equivalentBrl='',billingAddress=''}=req.body || {};
+      const invoiceMoney=invoiceValue(amount,currency);
+      const brl=amountInCents(currency==='BRL'?amount:equivalentBrl);
+      if(typeof billingAddress!=='string' || billingAddress.length>500)throw new Error('Endereço do doador deve ter até 500 caracteres.');
       if(!uuid.test(requestKey || '')) throw new Error('Identificador da solicitação inválido.');
       const existing=db.prepare('SELECT * FROM invoices WHERE request_key=?').get(requestKey);
       if(existing) return res.json(exposed(existing,true));
@@ -91,10 +96,12 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
       if(typeof dueDate!=='string' || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || new Date(dueDate+'T12:00:00Z').toISOString().slice(0,10)!==dueDate) throw new Error('Data inválida.');
       const expires=new Date(dueDate+'T23:59:59-05:00');
       if(expires.getTime()<Date.now() || expires.getTime()>Date.now()+366*86400000) throw new Error('Escolha uma data entre hoje e um ano.');
-      const btc=bitcoinAmount?satoshis(bitcoinAmount):null;
+      const btc=currency==='BTC'?invoiceMoney.minor:(bitcoinAmount?satoshis(bitcoinAmount):null);
+      if(currency==='BTC' && bitcoinAmount && satoshis(bitcoinAmount)!==btc)throw new Error('Valor alternativo BTC diverge da moeda principal.');
       if(btc && !bitcoin.enabled) throw new Error('Bitcoin não habilitado neste ambiente.');
       const id=randomBytes(24).toString('base64url');
-      db.prepare('INSERT INTO invoices(id,request_key,order_id,name,email,description,amount,expires_at,created_at,btc_sats) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id,requestKey,randomBytes(12).toString('hex'),name.trim(),email.trim(),description.trim(),amountInCents(amount),expires.toISOString(),new Date().toISOString(),btc);
+      db.prepare('INSERT INTO invoices(id,request_key,order_id,name,email,description,amount,expires_at,created_at,btc_sats,invoice_currency,invoice_minor,invoice_digits,billing_address) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,requestKey,randomBytes(12).toString('hex'),name.trim(),email.trim(),description.trim(),brl,expires.toISOString(),new Date().toISOString(),btc,currency,invoiceMoney.minor,invoiceMoney.digits,billingAddress.trim());
+      db.prepare("UPDATE invoices SET invoice_number=printf('EV-%06d',rowid) WHERE id=?").run(id);
       res.status(201).json(exposed(getInvoice(id),true));
     } catch(e) {res.status(400).json({error:e.message});}
   });
@@ -127,7 +134,8 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
     if(Object.keys(req.body || {}).some(k=>!['paymentToken','brand','demo','demoCurrency'].includes(k)))return res.status(400).json({error:'Envie somente o token do cartão.'});
     if(mode==='demo' ? demo!==true : (!uuid.test(paymentToken || '') || !['Visa','Master','Elo','Amex','Diners','JCB','Discover','Hipercard'].includes(brand))) return res.status(400).json({error:'Dados do pagamento inválidos.'});
     if(demoCurrency!==undefined && (mode!=='demo' || !['USD','EUR','GBP','JPY','KWD'].includes(demoCurrency))) return res.status(400).json({error:'Moeda de demonstração inválida.'});
-    const requestDcc=mode==='demo'?Boolean(demoCurrency):dccEnabled && ['Visa','Master'].includes(brand);
+    if(row.invoice_currency!=='BRL' && demoCurrency)return res.status(400).json({error:'A moeda desta fatura já foi definida. O cartão usa o equivalente em BRL informado na emissão.'});
+    const requestDcc=row.invoice_currency==='BRL' && (mode==='demo'?Boolean(demoCurrency):dccEnabled && ['Visa','Master'].includes(brand));
     const startedAt=new Date().toISOString();
     const locked=db.prepare("UPDATE invoices SET state='processing',dcc_requested=?,dcc_started_at=? WHERE id=? AND state='open'").run(requestDcc?1:0,requestDcc?startedAt:null,row.id);
     if(!locked.changes)return res.status(409).json({error:'Pagamento já em andamento.'});
@@ -185,6 +193,12 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
       savePayment(row,result,Boolean(row.dcc_requested && !row.choice_at && !row.quote_json));res.json(exposed(getInvoice(row.id),true));
     } catch {res.status(502).json({error:'Não foi possível confirmar na Cielo. Mantenha a cobrança em conferência e verifique no painel Cielo antes de criar outra.'});}
   });
+  async function pdf(req,res,admin){
+    const row=getInvoice(req.params.id);if(!row)return res.status(404).json({error:'Fatura não encontrada.'});
+    try{const data=exposed(row,admin);const buffer=await renderInvoicePdf({...data,name:admin?row.name:'Doador',email:admin?row.email:'',billingAddress:admin?row.billing_address:'',url:`${origin}/p/${row.id}`});res.set({'Content-Type':'application/pdf','Content-Disposition':`attachment; filename="Fatura-${row.invoice_number}.pdf"`,'Cache-Control':'no-store'}).send(buffer);}catch{res.status(503).json({error:'Não foi possível gerar o PDF. Verifique o serviço de documentos e tente novamente.'});}
+  }
+  app.get('/api/invoices/:id/pdf',auth,(req,res)=>pdf(req,res,true));
+  app.get('/api/public/:id/pdf',(req,res)=>pdf(req,res,false));
   app.use(express.static(resolve(root,'public'),{index:false}));
   app.get('/',(req,res)=>res.sendFile(resolve(root,'public/index.html')));
   app.get('/p/:id',(req,res)=>res.sendFile(resolve(root,'public/pay.html')));

@@ -11,3 +11,5 @@ export async function api(path,body) {
 export function element(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}
 
 export const foreignMoney=(amount,currency,digits)=>new Intl.NumberFormat('pt-BR',{style:'currency',currency,currencyDisplay:'code'}).format(amount/10**digits);
+
+export const invoiceMoney=i=>i.invoiceCurrency==='BTC'?'BTC '+(i.invoiceAmount/1e8).toFixed(8):new Intl.NumberFormat('pt-BR',{style:'currency',currency:i.invoiceCurrency||'BRL',currencyDisplay:i.invoiceCurrency==='BRL'?'symbol':'code'}).format((i.invoiceAmount??i.amount)/10**(i.invoiceDigits??2));
