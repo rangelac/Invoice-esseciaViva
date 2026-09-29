@@ -11,6 +11,7 @@ import { readQuote, demoQuote } from './currency.js';
 import {installBitcoin,satoshis} from './bitcoin.js';
 import {currencies,invoiceValue} from './invoice-money.js';
 import {renderInvoicePdf} from './invoice-pdf.js';
+import {installDonationAmounts,donationCurrencies} from './donation-amount.js';
 const root = dirname(fileURLToPath(import.meta.url));
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function amountInCents(value) {
@@ -23,7 +24,7 @@ export function amountInCents(value) {
 export function paymentState(status) {
   return ({1:'authorized',2:'paid',3:'declined',10:'cancelled',11:'refunded',13:'cancelled'})[status] || 'review';
 }
-export function createApp(env=process.env, provider, bitcoinFetch) {
+export function createApp(env=process.env, provider, bitcoinFetch, ratesFetch) {
   const mode=env.PAYMENT_MODE || 'demo';
   if(!['demo','sandbox','production'].includes(mode)) throw new Error('PAYMENT_MODE inválido.');
   if(!env.ADMIN_PASSWORD || env.ADMIN_PASSWORD.length<16) throw new Error('Configure ADMIN_PASSWORD com ao menos 16 caracteres.');
@@ -43,7 +44,7 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
     CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, order_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, description TEXT NOT NULL, amount INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open', payment_id TEXT, checked_at TEXT);
   `);
   const columns=db.prepare('PRAGMA table_info(invoices)').all().map(c=>c.name);
-  for(const [column,type] of Object.entries({dcc_requested:'INTEGER NOT NULL DEFAULT 0',dcc_started_at:'TEXT',quote_json:'TEXT',choice_currency:'TEXT',choice_at:'TEXT',invoice_currency:"TEXT NOT NULL DEFAULT 'BRL'",invoice_minor:'INTEGER',invoice_digits:'INTEGER NOT NULL DEFAULT 2',invoice_number:'TEXT',billing_address:"TEXT NOT NULL DEFAULT ''"})) {
+  for(const [column,type] of Object.entries({allow_amount_edit:'INTEGER NOT NULL DEFAULT 0',payment_amount:'INTEGER',donation_json:'TEXT',dcc_requested:'INTEGER NOT NULL DEFAULT 0',dcc_started_at:'TEXT',quote_json:'TEXT',choice_currency:'TEXT',choice_at:'TEXT',invoice_currency:"TEXT NOT NULL DEFAULT 'BRL'",invoice_minor:'INTEGER',invoice_digits:'INTEGER NOT NULL DEFAULT 2',invoice_number:'TEXT',billing_address:"TEXT NOT NULL DEFAULT ''"})) {
     if(!columns.includes(column)) db.exec(`ALTER TABLE invoices ADD COLUMN ${column} ${type}`);
   }
   db.exec("UPDATE invoices SET invoice_minor=amount WHERE invoice_minor IS NULL; UPDATE invoices SET invoice_number=printf('EV-%06d',rowid) WHERE invoice_number IS NULL");
@@ -68,7 +69,7 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
     const quote=row.quote_json?JSON.parse(row.quote_json):null;
     const quoteExpired=row.state==='currency_choice' && quote && Date.parse(quote.expiresAt)<=Date.now();
     const state=quoteExpired?'quote_expired':row.state==='open' && Date.parse(row.expires_at)<Date.now()?'expired':row.state;
-    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,bitcoinEnabled:bitcoin.enabled,bitcoinAmount:row.btc_sats || null,paymentMethod:row.payment_method,currency:'BRL',invoiceCurrency:row.invoice_currency,invoiceAmount:row.invoice_minor,invoiceDigits:row.invoice_digits,number:row.invoice_number,pdfUrl:`${origin}/api/public/${row.id}/pdf`,dccEnabled:dccEnabled && row.invoice_currency==='BRL',quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,billingAddress:row.billing_address,bitcoinTxid:row.btc_txid,bitcoinVout:row.btc_vout,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
+    return {id:row.id,description:row.description,amount:row.payment_amount ?? row.amount,originalAmount:row.amount,allowAmountEdit:Boolean(row.allow_amount_edit),donationCurrencies,donation:row.donation_json?JSON.parse(row.donation_json):null,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,bitcoinEnabled:bitcoin.enabled,bitcoinAmount:row.btc_sats || null,paymentMethod:row.payment_method,currency:'BRL',invoiceCurrency:row.invoice_currency,invoiceAmount:row.invoice_minor,invoiceDigits:row.invoice_digits,number:row.invoice_number,pdfUrl:`${origin}/api/public/${row.id}/pdf`,dccEnabled:dccEnabled && row.invoice_currency==='BRL',quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,billingAddress:row.billing_address,bitcoinTxid:row.btc_txid,bitcoinVout:row.btc_vout,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
   }
   function available(row) { return row && row.state==='open' && Date.parse(row.expires_at)>Date.now(); }
   app.post('/api/login',rateLimit({windowMs:15*60000,limit:10,skipSuccessfulRequests:true}), (req,res)=>{
@@ -83,7 +84,8 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
   app.get('/api/invoices',auth,(req,res)=>res.json({mode,currencies,invoices:db.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all().map(r=>exposed(r,true))}));
   app.post('/api/invoices',auth,(req,res)=>{
     try {
-      const {name,email='',description,amount,dueDate,requestKey,currency='BRL',bitcoinAmount='',equivalentBrl='',billingAddress=''}=req.body || {};
+      const {name,email='',description,amount,dueDate,requestKey,currency='BRL',bitcoinAmount='',equivalentBrl='',billingAddress='',allowAmountEdit=false}=req.body || {};
+      if(typeof allowAmountEdit!=='boolean')throw new Error('Opção de ajuste inválida.');
       const invoiceMoney=invoiceValue(amount,currency);
       const brl=amountInCents(currency==='BRL'?amount:equivalentBrl);
       if(typeof billingAddress!=='string' || billingAddress.length>500)throw new Error('Endereço do doador deve ter até 500 caracteres.');
@@ -101,12 +103,13 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
       if(btc && !bitcoin.enabled) throw new Error('Bitcoin não habilitado neste ambiente.');
       const id=randomBytes(24).toString('base64url');
       db.prepare('INSERT INTO invoices(id,request_key,order_id,name,email,description,amount,expires_at,created_at,btc_sats,invoice_currency,invoice_minor,invoice_digits,billing_address) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,requestKey,randomBytes(12).toString('hex'),name.trim(),email.trim(),description.trim(),brl,expires.toISOString(),new Date().toISOString(),btc,currency,invoiceMoney.minor,invoiceMoney.digits,billingAddress.trim());
-      db.prepare("UPDATE invoices SET invoice_number=printf('EV-%06d',rowid) WHERE id=?").run(id);
+      db.prepare("UPDATE invoices SET invoice_number=printf('EV-%06d',rowid),allow_amount_edit=? WHERE id=?").run(allowAmountEdit?1:0,id);
       res.status(201).json(exposed(getInvoice(id),true));
     } catch(e) {res.status(400).json({error:e.message});}
   });
   app.get('/api/public/:id',(req,res)=>{const row=getInvoice(req.params.id); if(!row)return res.status(404).json({error:'Cobrança não encontrada.'});res.json(exposed(row));});
   const payLimit=rateLimit({windowMs:15*60000,limit:20});
+  const selectedQuote=installDonationAmounts(app,{db,mode,getInvoice,available,payLimit,fetcher:ratesFetch});
   const bitcoin=installBitcoin(app,{db,env,mode,auth,exposed,getInvoice,available,payLimit,fetcher:bitcoinFetch});
   app.post('/api/public/:id/sop',payLimit,async(req,res)=>{
     if(!available(getInvoice(req.params.id))) return res.status(409).json({error:'Esta cobrança não está disponível para pagamento.'});
@@ -115,11 +118,11 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
   });
   function savePayment(row,result,initial=false) {
     const payment=result?.Payment;
-    if(!payment || !uuid.test(payment.PaymentId || '') || result.MerchantOrderId!==row.order_id || payment.Amount!==row.amount || payment.Type!=='CreditCard' || (payment.Currency && payment.Currency!=='BRL')) throw new Error('Resposta não conciliada.');
+    if(!payment || !uuid.test(payment.PaymentId || '') || result.MerchantOrderId!==row.order_id || payment.Amount!==(row.payment_amount ?? row.amount) || payment.Type!=='CreditCard' || (payment.Currency && payment.Currency!=='BRL')) throw new Error('Resposta não conciliada.');
     if(initial && row.dcc_requested && payment.Status===12 && !row.choice_at) {
       // Persist the provider ID before parsing so malformed quotes can still be reconciled.
       db.prepare('UPDATE invoices SET payment_id=? WHERE id=?').run(payment.PaymentId,row.id);
-      const quote=readQuote(payment,row.amount,row.dcc_started_at,markupPercent);
+      const quote=readQuote(payment,row.payment_amount ?? row.amount,row.dcc_started_at,markupPercent);
       db.prepare("UPDATE invoices SET state='currency_choice',quote_json=?,checked_at=? WHERE id=?").run(JSON.stringify(quote),new Date().toISOString(),row.id);
       return;
     }
@@ -130,18 +133,21 @@ export function createApp(env=process.env, provider, bitcoinFetch) {
   app.post('/api/public/:id/pay',payLimit,async(req,res)=>{
     const row=getInvoice(req.params.id);
     if(!available(row)) return res.status(409).json({error:'Pagamento já enviado, vencido ou em conferência. Consulte o status antes de pagar novamente.'});
-    const {paymentToken,brand,demo,demoCurrency} = req.body || {};
-    if(Object.keys(req.body || {}).some(k=>!['paymentToken','brand','demo','demoCurrency'].includes(k)))return res.status(400).json({error:'Envie somente o token do cartão.'});
+    const {paymentToken,brand,demo,demoCurrency,amountQuoteId} = req.body || {};
+    if(Object.keys(req.body || {}).some(k=>!['paymentToken','brand','demo','demoCurrency','amountQuoteId'].includes(k)))return res.status(400).json({error:'Envie somente o token do cartão.'});
     if(mode==='demo' ? demo!==true : (!uuid.test(paymentToken || '') || !['Visa','Master','Elo','Amex','Diners','JCB','Discover','Hipercard'].includes(brand))) return res.status(400).json({error:'Dados do pagamento inválidos.'});
     if(demoCurrency!==undefined && (mode!=='demo' || !['USD','EUR','GBP','JPY','KWD'].includes(demoCurrency))) return res.status(400).json({error:'Moeda de demonstração inválida.'});
     if(row.invoice_currency!=='BRL' && demoCurrency)return res.status(400).json({error:'A moeda desta fatura já foi definida. O cartão usa o equivalente em BRL informado na emissão.'});
+    let donation;
+    try{donation=selectedQuote(row,amountQuoteId);}catch(e){return res.status(400).json({error:e.message});}
+    const paymentAmount=donation?.brl ?? row.amount;
     const requestDcc=row.invoice_currency==='BRL' && (mode==='demo'?Boolean(demoCurrency):dccEnabled && ['Visa','Master'].includes(brand));
     const startedAt=new Date().toISOString();
-    const locked=db.prepare("UPDATE invoices SET state='processing',dcc_requested=?,dcc_started_at=? WHERE id=? AND state='open'").run(requestDcc?1:0,requestDcc?startedAt:null,row.id);
+    const locked=db.prepare("UPDATE invoices SET state='processing',dcc_requested=?,dcc_started_at=?,payment_amount=?,donation_json=? WHERE id=? AND state='open'").run(requestDcc?1:0,requestDcc?startedAt:null,paymentAmount,donation?JSON.stringify(donation):null,row.id);
     if(!locked.changes)return res.status(409).json({error:'Pagamento já em andamento.'});
     try {
       const current=getInvoice(row.id);
-      if(mode==='demo' && demoCurrency) savePayment(current,{MerchantOrderId:row.order_id,Payment:{PaymentId:randomUUID(),Type:'CreditCard',Amount:row.amount,Status:12,CurrencyExchangeData:{CurrencyExchanges:[demoQuote(demoCurrency,row.amount)]}}},true);
+      if(mode==='demo' && demoCurrency) savePayment(current,{MerchantOrderId:row.order_id,Payment:{PaymentId:randomUUID(),Type:'CreditCard',Amount:paymentAmount,Status:12,CurrencyExchangeData:{CurrencyExchanges:[demoQuote(demoCurrency,paymentAmount)]}}},true);
       else if(mode==='demo') db.prepare("UPDATE invoices SET state='paid',checked_at=? WHERE id=?").run(new Date().toISOString(),row.id);
       else savePayment(current,await client.create(current,paymentToken,brand),true);
       res.json(exposed(getInvoice(row.id)));

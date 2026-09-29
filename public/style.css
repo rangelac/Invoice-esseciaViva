@@ -5,3 +5,5 @@
 #choose-bitcoin{margin:10px 0 22px;border-color:#e4bd76;background:#fffaf1}#bitcoin-box{margin-top:22px}#bitcoin-qr{display:block;max-width:100%;margin:15px auto}#bitcoin-amount{font-size:24px;font-weight:600}#bitcoin-links{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.badge.bitcoin_pending,.badge.bitcoin_review{background:#fff3db;color:#996828}#bitcoin-admin-error{color:#ae4e3b;font-size:12px}
 
 .share-actions{flex-wrap:wrap}#card-equivalent{line-height:1.7;margin-top:15px}#download-invoice{margin-bottom:18px}
+
+#donation-fields{border:1px solid #dce4d8;border-radius:16px;padding:18px;margin:0 0 22px;min-width:0}#donation-fields legend{font-weight:700;padding:0 6px}#donation-confirmation{overflow-wrap:anywhere}

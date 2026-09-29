@@ -51,7 +51,13 @@ story.append(Spacer(1,12))
 summary=Table([[p('Subtotal'),p(amount)],[p('Total','heading'),p(amount,'heading')],[p('Saldo a pagar'),p(money(0,data['invoiceCurrency'],data['invoiceDigits']) if data['state'] in ['paid','cancelled','refunded'] else amount)]],colWidths=[140,160],hAlign='RIGHT');summary.setStyle(TableStyle([('LINEABOVE',(0,1),(-1,1),.7,line),('TOPPADDING',(0,0),(-1,-1),7)]));story.append(summary)
 story.append(Spacer(1,20))
 pay=[]
-if data['invoiceCurrency']!='BRL':pay.append(p('Pagamento com cartão: '+money(data['amount'])+'. Equivalente em reais definido pela ONG na emissão; a cobrança Cielo é em BRL.','small'))
+if data.get('donation'):
+ d=data['donation']
+ pay.append(p('Ajuste autorizado pelo doador: '+money(d['minor'],d['currency'],d['digits'])+'. Valor enviado ao cartão: '+money(data['amount'])+'.','small'))
+ pay.append(p('Referência: '+d['source']+' de '+d['date']+'. O total original da fatura foi preservado. A doação ajustada quita esta solicitação quando o pagamento é confirmado.','small'))
+elif data.get('allowAmountEdit'):
+ pay.append(p('O doador pode ajustar o valor do cartão na página de pagamento. O total acima é o valor sugerido na emissão.','small'))
+if not data.get('donation') and data['invoiceCurrency']!='BRL':pay.append(p('Pagamento com cartão: '+money(data['amount'])+'. Equivalente em reais definido pela ONG na emissão; a cobrança Cielo é em BRL.','small'))
 if data.get('bitcoinAmount'):pay.append(p('Alternativa Bitcoin: '+money(data['bitcoinAmount'],'BTC',8)+'. Rede Bitcoin. Consulte as instruções na página de pagamento.','small'))
 url=data['url'];q=QrCodeWidget(url);bounds=q.getBounds();size=116;qr=Drawing(size,size,transform=[size/(bounds[2]-bounds[0]),0,0,size/(bounds[3]-bounds[1]),0,0]);qr.add(q)
 link=Paragraph('<link href="'+escape(url,{'"':'&quot;'})+'" color="#315d46"><b>Pagar online / Pay online</b></link>',styles['heading'])

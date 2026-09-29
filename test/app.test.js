@@ -7,6 +7,7 @@ import {invoiceValue} from '../invoice-money.js';
 import {bech32m} from 'bech32';
 import {validBitcoinAddress,satoshis,verifyBitcoin} from '../bitcoin.js';
 import {readQuote} from '../currency.js';
+import {rateClient} from '../donation-amount.js';
 const password='test-only-password-123456789';
 async function fixture(t,provider,mode='demo',extraEnv={},bitcoinFetch) {
  const {app,db}=createApp({ADMIN_PASSWORD:password,PAYMENT_MODE:mode,PUBLIC_URL:'http://localhost:3000',DB_PATH:':memory:',CIELO_MERCHANT_ID:'test',CIELO_MERCHANT_KEY:'test',CIELO_SOP_CLIENT_ID:'test',CIELO_SOP_CLIENT_SECRET:'test',...extraEnv},provider,bitcoinFetch);
@@ -108,3 +109,56 @@ test('fatura conserva moeda e valor originais e cobra apenas o equivalente BRL',
 test('precisão por moeda, incluindo zero, três e oito casas',()=>{assert.deepEqual(invoiceValue('1200','JPY'),{minor:1200,digits:0});assert.deepEqual(invoiceValue('1.234','KWD'),{minor:1234,digits:3});assert.deepEqual(invoiceValue('0.00001001','BTC'),{minor:1001,digits:8});assert.throws(()=>invoiceValue('12.50','JPY'));assert.throws(()=>invoiceValue('0.001','EUR'));assert.throws(()=>invoiceValue('100','INVALID'));});
 test('fatura BTC define valor principal e mantém equivalente para cartão',async t=>{const f=await fixture(t);const {invoice}=await f.create({currency:'BTC',amount:'0.0001',equivalentBrl:'50.00'});assert.equal(invoice.invoiceAmount,10000);assert.equal(invoice.bitcoinAmount,10000);assert.equal(invoice.amount,5000);assert.equal(invoice.invoiceDigits,8);});
 test('PDF está disponível na emissão, com autenticação na versão completa',async t=>{const f=await fixture(t);const {invoice}=await f.create({currency:'USD',amount:'100',equivalentBrl:'500'});const path=`/api/invoices/${invoice.id}/pdf`;assert.equal((await fetch(f.base+path)).status,401);const pdf=await f.request(path);assert.equal(pdf.status,200);assert.equal(pdf.headers.get('content-type'),'application/pdf');assert.match(pdf.headers.get('content-disposition'),/Fatura-EV-/);assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0,5).toString(),'%PDF-');assert.equal((await f.request(`/api/public/${invoice.id}/pdf`)).status,200);});
+
+
+test('ajuste é opt-in; limites, precisão e proteção contra campos arbitrários',async t=>{
+ const f=await fixture(t);const fixed=(await f.create()).invoice;
+ assert.equal((await f.request(`/api/public/${fixed.id}/donation-quote`,{currency:'USD',value:'1000'})).status,409);
+ const i=(await f.create({allowAmountEdit:true})).invoice;const path=`/api/public/${i.id}/donation-quote`;
+ for(const body of [{currency:'USD',value:'0'},{currency:'USD',value:'25000'},{currency:'JPY',value:'2.01'},{currency:'USD',value:'10',rate:1},{currency:'BTC',value:'1'}])assert.equal((await f.request(path,body)).status,400);
+ const quote=await (await f.request(path,{currency:'USD',value:'1000'})).json();assert.equal(quote.brl,500000);assert.equal(quote.minor,100000);
+ assert.equal((await f.request(`/api/public/${fixed.id}/pay`,{demo:true,amountQuoteId:quote.id})).status,400);
+});
+
+test('cotação vinculada à fatura, vencimento e rejeição de valor forjado',async t=>{
+ const f=await fixture(t);const a=(await f.create({allowAmountEdit:true})).invoice,b=(await f.create({allowAmountEdit:true})).invoice;
+ const quote=await (await f.request(`/api/public/${a.id}/donation-quote`,{currency:'USD',value:'1000'})).json();
+ assert.equal((await f.request(`/api/public/${b.id}/pay`,{demo:true,amountQuoteId:quote.id})).status,400);
+ assert.equal((await f.request(`/api/public/${a.id}/pay`,{demo:true,amountQuoteId:quote.id,amount:1})).status,400);
+ f.db.prepare('UPDATE donation_quotes SET expires_at=? WHERE id=?').run('2020-01-01T00:00:00Z',quote.id);
+ assert.equal((await f.request(`/api/public/${a.id}/pay`,{demo:true,amountQuoteId:quote.id})).status,400);
+ assert.equal((await (await f.request(`/api/public/${a.id}`)).json()).state,'open');
+});
+
+test('valor ajustado persiste, conserva original, concilia com Cielo e impede duplicidade',async t=>{
+ let submitted,calls=0;const f=await fixture(t,{async create(row){submitted=row;calls++;return {MerchantOrderId:row.order_id,Payment:{PaymentId:randomUUID(),Amount:row.payment_amount,Type:'CreditCard',Status:2}};}},'sandbox');
+ const i=(await f.create({allowAmountEdit:true})).invoice;
+ const q=await (await f.request(`/api/public/${i.id}/donation-quote`,{currency:'BRL',value:'25.00'})).json();
+ const body={amountQuoteId:q.id,paymentToken:randomUUID(),brand:'Visa'};
+ const responses=await Promise.all([f.request(`/api/public/${i.id}/pay`,body),f.request(`/api/public/${i.id}/pay`,body)]);
+ assert.deepEqual(responses.map(r=>r.status).sort(),[200,409]);assert.equal(calls,1);assert.equal(submitted.payment_amount,2500);assert.equal(submitted.amount,12590);
+ const final=await (await f.request(`/api/public/${i.id}`)).json();assert.equal(final.state,'paid');assert.equal(final.amount,2500);assert.equal(final.originalAmount,12590);assert.equal(final.invoiceAmount,12590);assert.equal(final.donation.minor,2500);
+ assert.equal((await f.request(`/api/public/${i.id}/donation-quote`,{currency:'BRL',value:'1'})).status,409);
+});
+
+test('DCC usa valor ajustado e recusa alteração após iniciar',async t=>{
+ const f=await fixture(t);const i=(await f.create({allowAmountEdit:true})).invoice;
+ const q=await (await f.request(`/api/public/${i.id}/donation-quote`,{currency:'USD',value:'1000'})).json();
+ const offered=await (await f.request(`/api/public/${i.id}/pay`,{demo:true,demoCurrency:'USD',amountQuoteId:q.id})).json();
+ assert.equal(offered.state,'currency_choice');assert.equal(offered.amount,500000);assert.equal(offered.invoiceAmount,12590);
+ assert.equal((await f.request(`/api/public/${i.id}/donation-quote`,{currency:'BRL',value:'1'})).status,409);
+ assert.equal((await f.request(`/api/public/${i.id}/confirm-currency`,{currency:'USD',amountQuoteId:q.id})).status,400);
+ assert.equal((await (await f.request(`/api/public/${i.id}/confirm-currency`,{currency:'USD'})).json()).state,'paid');
+});
+
+test('fonte de câmbio valida data e moeda, usa cache e não substitui falha por câmbio fictício',async()=>{
+ let calls=0;const client=rateClient('production',async()=>{calls++;return {ok:true,json:async()=>({base:'USD',quote:'BRL',rate:5.2,date:new Date().toISOString().slice(0,10)})};});
+ assert.equal((await client('USD')).rate,5.2);await client('USD');assert.equal(calls,1);
+ for(const data of [{base:'EUR',quote:'BRL',rate:5,date:new Date().toISOString().slice(0,10)},{base:'USD',quote:'BRL',rate:5,date:'2020-01-01'},{base:'USD',quote:'BRL',rate:-1,date:new Date().toISOString().slice(0,10)}])await assert.rejects(rateClient('production',async()=>({ok:true,json:async()=>data}))('USD'));
+ await assert.rejects(rateClient('production',async()=>({ok:false}))('USD'));
+});
+
+test('adaptador Cielo transmite o valor ajustado persistido',async()=>{
+ let body;const client=cieloClient({PAYMENT_MODE:'production'},async(url,options)=>{body=JSON.parse(options.body);return {ok:true,json:async()=>({})};});
+ await client.create({order_id:'x',name:'Teste',amount:12590,payment_amount:500000},randomUUID(),'Visa');assert.equal(body.Payment.Amount,500000);
+});

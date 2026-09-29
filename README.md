@@ -66,7 +66,7 @@ Referências consultadas em 28/09/2026.
 
 O valor enviado à Cielo e os totais de referência da organização continuam em **BRL**. A moeda do documento agora é escolhida na criação, como descrito abaixo. O fluxo DCC desta seção se aplica apenas a faturas emitidas em BRL. Para cartões estrangeiros elegíveis Visa/Mastercard à vista, a Cielo pode oferecer a moeda local do cartão (por exemplo USD, EUR ou GBP). O doador escolhe entre BRL e a oferta retornada; não é uma lista livre para cobrar arbitrariamente em qualquer moeda.
 
-- A página usa a moeda, o valor convertido e o câmbio retornados pela Cielo. Nenhuma cotação externa é usada em pagamentos reais.
+- A página usa a moeda, o valor convertido e o câmbio retornados pela Cielo. A oferta DCC usa somente a cotação da Cielo. A estimativa anterior para ajuste voluntário usa uma fonte externa, conforme a seção de valor ajustável.
 - Nenhuma opção vem pré-selecionada. A tela informa valor em BRL, valor estrangeiro, câmbio, markup e vencimento da oferta. O markup documentado pela Cielo na consulta é de 16%, configurável em `CIELO_DCC_MARKUP_PERCENT` e preservado junto à oferta.
 - A confirmação é enviada ao endpoint `/1/sales/{PaymentId}/confirm`, com `CurrencyConversion` verdadeiro para moeda estrangeira ou falso para BRL. Uma consulta independente confirma o resultado.
 - O prazo máximo de 20 minutos começa antes da requisição de cotação; não é renovado ao atualizar a página. Cotações expiradas e respostas incertas não geram uma segunda tentativa automática.
@@ -117,7 +117,7 @@ Referências: https://docs.cielo.com.br/ecommerce-cielo/docs/cart%C3%A3o-de-debi
 O formulário permite escolher a moeda **antes de emitir a fatura**. O catálogo inclui as moedas ISO reconhecidas pelo runtime e Bitcoin. Essa é a moeda do documento, não uma declaração de que a Cielo liquida em todas elas.
 
 - Moeda, valor em unidades mínimas, precisão, endereço do doador e número sequencial `EV-000001` são persistidos. Faturas antigas são migradas para BRL sem mudar os valores existentes.
-- Para moeda diferente de BRL, o administrador informa também o equivalente fixo em reais. Não há câmbio automático. A página e o PDF mostram os dois valores claramente; apenas o equivalente BRL é enviado para a Cielo. Os limites atuais de pagamento em reais permanecem R$ 1 a R$ 100.000.
+- Para moeda diferente de BRL, o administrador informa também o equivalente fixo em reais. Esse equivalente original não muda automaticamente. Quando a ONG autoriza ajuste, o doador pode revisar outra estimativa antes do pagamento. A página e o PDF mostram os valores claramente; apenas o equivalente BRL é enviado para a Cielo. Os limites atuais de pagamento em reais permanecem R$ 1 a R$ 100.000.
 - A escolha documental não força o DCC nem garante uma cobrança nativa em dólar/euro. Para faturas estrangeiras, o fluxo não oferece nova escolha DCC. Cobrança nativa e liquidação em moeda estrangeira exigiriam outro arranjo/provedor compatível.
 - Em BTC, o valor principal também define o valor da alternativa Bitcoin; o equivalente em BRL serve para cartão e totais de referência.
 - O botão **Baixar PDF** fica disponível ao finalizar a criação, na lista e na página de pagamento. O PDF contém número da fatura, emissão, vencimento, descrição, moeda, total, situação e QR Code para o link exclusivo `/p/:id`. Não aponta para uma página genérica de doação.
@@ -128,3 +128,32 @@ O formulário permite escolher a moeda **antes de emitir a fatura**. O catálogo
 - O comprovante de pagamento anterior e a fatura são documentos distintos: a fatura pode ser emitida antes do pagamento. Não é nota fiscal.
 
 O modelo visual foi conferido em PNG e o conteúdo do QR Code foi decodificado após renderizar o PDF. Testes cobrem valores EUR/JPY/KWD/BTC, conservação do equivalente BRL e acesso aos downloads.
+
+
+## Valor ajustável pelo doador
+
+Na criação, marque **Permitir que o doador altere o valor para cartão**. Por padrão, faturas novas e antigas continuam com valor fixo. Essa autorização aceita doações menores ou maiores e encerra a solicitação pelo valor confirmado; a diferença não é uma dívida nem gera cobrança adicional.
+
+- Antes de enviar o cartão, o doador escolhe BRL, USD, EUR, GBP, CAD, AUD, CHF ou JPY, recebe uma sugestão, edita o valor e clica em **Revisar e usar este valor**. Essa lista é de moedas de referência, não de moedas garantidas de débito no cartão.
+- A estimativa real usa a API Frankfurter v2 (referência diária, não cotação ao vivo nem da Cielo). Exibe fonte/data; rejeita dados inválidos ou com mais de sete dias. Há cache de dez minutos. Não envia dados pessoais ao serviço. Na indisponibilidade, oferece tentar depois ou escolher BRL, sem substituir por câmbio fictício. Demo usa taxas explicitamente fictícias.
+- O servidor grava uma estimativa com identificador aleatório, vinculada à fatura e válida por dez minutos. O navegador não define o câmbio nem o total BRL. A criação da cobrança na Cielo usa o valor da estimativa validada no servidor; valor e estimativa são fixados atomicamente quando começa o pagamento. Estimativas de outra fatura, vencidas ou posteriores ao início são recusadas.
+- O campo `amount` do banco mantém o equivalente BRL original; `payment_amount` guarda o valor de cartão e `donation_json` preserva a escolha e referência. A API expõe `originalAmount` e o `amount` efetivo. Painel, conciliação e PDF distinguem a fatura original da doação ajustada.
+- Depois do envio à Cielo, não se altera a estimativa nem se cria outra tentativa automática. DCC, quando habilitado, apresenta a oferta da Cielo para o valor ajustado e exige escolha separada. Não há garantia de debitar exatamente o valor estrangeiro desejado.
+- Bitcoin mantém seu valor fixo, sem usar a estimativa de cartão.
+
+Fonte: https://frankfurter.dev/
+
+## Preparação para publicação
+
+`npm run check:production` lê `.env.production` e lista requisitos ausentes sem imprimir segredos ou efetuar transações. O arquivo é privado e ignorado pelo Git. A configuração local `.env` continua em demo até estarem disponíveis o domínio HTTPS e as credenciais SOP. Credenciais comerciais não substituem Client ID e Client Secret do SOP.
+
+A imagem do `Dockerfile` contém Node 24 e Python/ReportLab e executa como usuário sem privilégios. `.dockerignore` exclui credenciais, dados e artefatos locais. A imagem foi preparada, mas precisa ser construída e validada no ambiente de hospedagem; não houve publicação nesta entrega.
+
+Para o responsável pela hospedagem:
+1. Configure os segredos na hospedagem, `PAYMENT_MODE=production`, `ENABLE_LIVE_PAYMENTS=true`, `PUBLIC_URL=https://seu-dominio` e as quatro credenciais Cielo/SOP.
+2. Monte um volume persistente em `/app/data` com escrita pelo UID 1000. Guarde backups consistentes do SQLite, incluindo a política de recuperação. Nunca use armazenamento efêmero para o banco.
+3. Encaminhe HTTPS ao serviço na porta 3000. Restrinja acesso à porta interna. Use uma instância para a sessão administrativa e o banco SQLite atuais.
+4. Execute a verificação de produção e homologue crédito/SOP na conta. DCC permanece desativado até homologação específica. Débito permanece pendente de 3DS.
+5. Valide aprovação, recusa, timeout e conciliação no ambiente final. A verificação de configuração e os testes simulados não comprovam autorização de pagamentos reais.
+
+A atualização de pagamentos em conferência ainda é feita pelo botão **Consultar Cielo** no painel; não há webhook nem conciliação automática em segundo plano nesta versão.

@@ -10,7 +10,8 @@
     "start": "node --env-file-if-exists=.env server.js",
     "test": "node --test",
     "check": "node --check server.js && node --check public/app.js && node --check public/pay.js",
-    "test:ui": "node scripts/verify-ui.mjs"
+    "test:ui": "node scripts/verify-ui.mjs",
+    "check:production": "node --env-file-if-exists=.env.production scripts/check-production.mjs"
   },
   "dependencies": {
     "bech32": "^2.0.0",

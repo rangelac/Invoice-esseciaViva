@@ -18,7 +18,7 @@ export function cieloClient(env, fetcher = fetch) {
     },
     create(invoice, paymentToken, brand) {
       if(invoice.dcc_requested && !production) throw new Error("DCC requer o ambiente de produção da Cielo.");
-      return call(`https://api${suffix}.cieloecommerce.cielo.com.br/v2/sales/`, {method:'POST',headers:headers(),body:JSON.stringify({MerchantOrderId:invoice.order_id, Customer:{Name:invoice.name}, Payment:{Type:'CreditCard',Amount:invoice.amount,...(invoice.dcc_requested?{DynamicCurrencyConversion:true}:{}),Installments:1,Capture:true,SoftDescriptor:'ESSENCIAVIVA',CreditCard:{PaymentToken:paymentToken,Brand:brand}}})});
+      return call(`https://api${suffix}.cieloecommerce.cielo.com.br/v2/sales/`, {method:'POST',headers:headers(),body:JSON.stringify({MerchantOrderId:invoice.order_id, Customer:{Name:invoice.name}, Payment:{Type:'CreditCard',Amount:invoice.payment_amount ?? invoice.amount,...(invoice.dcc_requested?{DynamicCurrencyConversion:true}:{}),Installments:1,Capture:true,SoftDescriptor:'ESSENCIAVIVA',CreditCard:{PaymentToken:paymentToken,Brand:brand}}})});
     },
     confirm(id, convert) {
       if(!production) throw new Error('DCC requer o ambiente de produção da Cielo.');
