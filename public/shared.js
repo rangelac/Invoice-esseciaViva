@@ -1,4 +1,4 @@
-export const labels={currency_choice:'Escolher moeda',quote_expired:'Cotação expirada',open:'Em aberto',paid:'Paga',review:'Em conferência',processing:'Processando',authorized:'Autorizada',declined:'Recusada',cancelled:'Cancelada',refunded:'Estornada',expired:'Vencida'};
+export const labels={bitcoin_pending:'Aguardando Bitcoin',bitcoin_review:'Conferir Bitcoin',currency_choice:'Escolher moeda',quote_expired:'Cotação expirada',open:'Em aberto',paid:'Paga',review:'Em conferência',processing:'Processando',authorized:'Autorizada',declined:'Recusada',cancelled:'Cancelada',refunded:'Estornada',expired:'Vencida'};
 export const money=n=>new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(n/100);
 export const date=s=>new Intl.DateTimeFormat('pt-BR',{timeZone:'America/Rio_Branco'}).format(new Date(s));
 export async function api(path,body) {

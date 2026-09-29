@@ -13,9 +13,11 @@
     "test:ui": "node scripts/verify-ui.mjs"
   },
   "dependencies": {
+    "bech32": "^2.0.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
-    "helmet": "^8.1.0"
+    "helmet": "^8.1.0",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0"

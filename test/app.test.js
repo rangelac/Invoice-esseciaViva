@@ -3,15 +3,17 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {createApp, amountInCents, paymentState} from '../server.js';
 import {cieloClient} from '../cielo.js';
+import {bech32m} from 'bech32';
+import {validBitcoinAddress,satoshis,verifyBitcoin} from '../bitcoin.js';
 import {readQuote} from '../currency.js';
 const password='test-only-password-123456789';
-async function fixture(t,provider,mode='demo',extraEnv={}) {
- const {app,db}=createApp({ADMIN_PASSWORD:password,PAYMENT_MODE:mode,PUBLIC_URL:'http://localhost:3000',DB_PATH:':memory:',CIELO_MERCHANT_ID:'test',CIELO_MERCHANT_KEY:'test',CIELO_SOP_CLIENT_ID:'test',CIELO_SOP_CLIENT_SECRET:'test',...extraEnv},provider);
+async function fixture(t,provider,mode='demo',extraEnv={},bitcoinFetch) {
+ const {app,db}=createApp({ADMIN_PASSWORD:password,PAYMENT_MODE:mode,PUBLIC_URL:'http://localhost:3000',DB_PATH:':memory:',CIELO_MERCHANT_ID:'test',CIELO_MERCHANT_KEY:'test',CIELO_SOP_CLIENT_ID:'test',CIELO_SOP_CLIENT_SECRET:'test',...extraEnv},provider,bitcoinFetch);
  const server=app.listen(0,'127.0.0.1'); await new Promise(r=>server.once('listening',r));
  t.after(()=>{server.closeAllConnections();server.close();db.close();});
  const base=`http://127.0.0.1:${server.address().port}`;
  let cookie='';
- async function request(path,body,extra={}){return fetch(base+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json','X-Essencia-Request':'1',Origin:'http://localhost:3000',Cookie:cookie,...extra},...(body===undefined?{}:{body:JSON.stringify(body)})});}
+ async function request(path,body,extra={}){return fetch(base+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json','X-Essencia-Request':'1',Origin:extraEnv.PUBLIC_URL || 'http://localhost:3000',Cookie:cookie,...extra},...(body===undefined?{}:{body:JSON.stringify(body)})});}
  const login=await request('/api/login',{password});cookie=login.headers.get('set-cookie').split(';')[0];
  async function create(extra={}){const r=await request('/api/invoices',{name:'Doador Teste',email:'teste@example.com',description:'Apoio à ONG',amount:'125,90',dueDate:new Date(Date.now()+86400000).toISOString().slice(0,10),requestKey:randomUUID(),...extra});return {response:r,invoice:await r.json()};}
  return {request,create,db,base};
@@ -69,4 +71,30 @@ test('adaptador DCC solicita conversão e confirma com booleano, sem receber câ
 test('moeda de cobrança não pode ser alterada para simular suporte estrangeiro',async t=>{const f=await fixture(t);assert.equal((await f.create({currency:'USD'})).response.status,400);});
 test('conferência de cotação expirada consulta a Cielo sem renovar oferta',async t=>{
  const provider=dccProvider();const f=await fixture(t,provider,'sandbox',{CIELO_DCC_ENABLED:'true'});const {invoice}=await f.create();await f.request(`/api/public/${invoice.id}/pay`,{paymentToken:randomUUID(),brand:'Visa'});const row=f.db.prepare('SELECT quote_json FROM invoices WHERE id=?').get(invoice.id);const quote=JSON.parse(row.quote_json);quote.expiresAt='2020-01-01T00:00:00Z';f.db.prepare('UPDATE invoices SET quote_json=? WHERE id=?').run(JSON.stringify(quote),invoice.id);const result=await (await f.request(`/api/invoices/${invoice.id}/refresh`,{})).json();assert.equal(result.state,'paid');assert.equal(result.quote.expiresAt,'2020-01-01T00:00:00Z');assert.equal(provider.confirmations.length,0);
+});
+
+const btcAddress=bech32m.encode('bc',[1,...bech32m.toWords(new Uint8Array(32).fill(1))]);
+test('Bitcoin valida checksum, rede e satoshis sem arredondar',()=>{assert.equal(validBitcoinAddress(btcAddress),true);assert.equal(validBitcoinAddress(btcAddress.slice(0,-1)+'x'),false);assert.equal(validBitcoinAddress('0xb505848f20D3776055100E943d5818b01AC59C47'),false);assert.equal(satoshis('0,00001001'),1001);for(const v of ['0.000000001','-1','1e-4','0.00000001'])assert.throws(()=>satoshis(v));});
+test('Bitcoin demo oculta endereço real, bloqueia cartão e exige baixa administrativa',async t=>{
+ const f=await fixture(t,undefined,'demo',{BITCOIN_ADDRESS:btcAddress});const {invoice}=await f.create({bitcoinAmount:'0.0001'});const endpoint=`/api/public/${invoice.id}`;
+ const selected=await (await f.request(endpoint+'/bitcoin',{})).json();assert.equal(selected.address,null);assert.equal(selected.qr,null);assert.equal(selected.invoice.state,'bitcoin_pending');assert.equal((await f.request(endpoint+'/pay',{demo:true})).status,409);
+ const txid='a'.repeat(64);const reported=await (await f.request(endpoint+'/bitcoin-report',{txid})).json();assert.equal(reported.state,'bitcoin_review');assert.equal((await f.request(`/api/invoices/${invoice.id}/bitcoin-confirm`,{txid,vout:0})).status,400);
+ const paid=await (await f.request(`/api/invoices/${invoice.id}/bitcoin-confirm`,{txid,vout:0,verifiedWithDonor:true})).json();assert.equal(paid.state,'paid');assert.equal(paid.paymentMethod,'bitcoin');
+ const second=(await f.create({bitcoinAmount:'0.0001'})).invoice;await f.request(`/api/public/${second.id}/bitcoin`,{});assert.equal((await f.request(`/api/invoices/${second.id}/bitcoin-confirm`,{txid,vout:0,verifiedWithDonor:true})).status,400);
+});
+test('Bitcoin não pode ser selecionado sem valor BTC e não substitui cartão já iniciado',async t=>{const f=await fixture(t);const a=(await f.create()).invoice;assert.equal((await f.request(`/api/public/${a.id}/bitcoin`,{})).status,409);const b=(await f.create({bitcoinAmount:'0.001'})).invoice;await f.request(`/api/public/${b.id}/pay`,{demo:true});assert.equal((await f.request(`/api/public/${b.id}/bitcoin`,{})).status,409);});
+test('verificação da rede exige saída correta, valor, confirmações e bloco válido',async()=>{
+ const txid='a'.repeat(64), row={btc_address:btcAddress,btc_sats:10000,created_at:'2026-01-01T00:00:00Z'};
+ const tx={txid,vout:[{scriptpubkey_address:btcAddress,value:10000}],status:{confirmed:true,block_height:100,block_time:1780000000,block_hash:'b'.repeat(64)}};
+ let tip=102,inChain=true;
+ const fetcher=async url=>({ok:true,json:async()=>url.includes('/tx/')?tx:{in_best_chain:inChain},text:async()=>String(tip)});
+ assert.equal((await verifyBitcoin(row,txid,0,fetcher)).confirmations,3);
+ tip=101;await assert.rejects(verifyBitcoin(row,txid,0,fetcher));tip=102;tx.vout[0].value=9999;await assert.rejects(verifyBitcoin(row,txid,0,fetcher));tx.vout[0].value=10000;inChain=false;await assert.rejects(verifyBitcoin(row,txid,0,fetcher));inChain=true;tx.vout[0].scriptpubkey_address='other';await assert.rejects(verifyBitcoin(row,txid,0,fetcher));
+});
+
+test('Bitcoin produção emite QR e só confirma após verificação da rede e do administrador',async t=>{
+ const txid='c'.repeat(64),mockFetch=async url=>({ok:true,text:async()=> '102',json:async()=>url.includes('/tx/')?{txid,vout:[{scriptpubkey_address:btcAddress,value:10000}],status:{confirmed:true,block_height:100,block_time:Math.floor(Date.now()/1000)+60,block_hash:'d'.repeat(64)}}:{in_best_chain:true}});
+ const f=await fixture(t,undefined,'production',{PUBLIC_URL:'https://example.test',ENABLE_LIVE_PAYMENTS:'true',ENABLE_BITCOIN:'true',BITCOIN_ADDRESS:btcAddress},mockFetch);
+ const {invoice}=await f.create({bitcoinAmount:'0.0001'});const selected=await (await f.request(`/api/public/${invoice.id}/bitcoin`,{})).json();assert.equal(selected.address,btcAddress);assert.match(selected.qr,/^data:image\/png;base64,/);assert.equal(selected.uri,`bitcoin:${btcAddress}?amount=0.00010000&label=Essencia%20Viva`);
+ const paid=await (await f.request(`/api/invoices/${invoice.id}/bitcoin-confirm`,{txid,vout:0,verifiedWithDonor:true})).json();assert.equal(paid.state,'paid');assert.equal(paid.bitcoinTxid,txid);
 });

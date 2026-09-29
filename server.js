@@ -8,6 +8,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cieloClient } from './cielo.js';
 import { readQuote, demoQuote } from './currency.js';
+import {installBitcoin,satoshis} from './bitcoin.js';
 const root = dirname(fileURLToPath(import.meta.url));
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function amountInCents(value) {
@@ -20,7 +21,7 @@ export function amountInCents(value) {
 export function paymentState(status) {
   return ({1:'authorized',2:'paid',3:'declined',10:'cancelled',11:'refunded',13:'cancelled'})[status] || 'review';
 }
-export function createApp(env=process.env, provider) {
+export function createApp(env=process.env, provider, bitcoinFetch) {
   const mode=env.PAYMENT_MODE || 'demo';
   if(!['demo','sandbox','production'].includes(mode)) throw new Error('PAYMENT_MODE inválido.');
   if(!env.ADMIN_PASSWORD || env.ADMIN_PASSWORD.length<16) throw new Error('Configure ADMIN_PASSWORD com ao menos 16 caracteres.');
@@ -64,7 +65,7 @@ export function createApp(env=process.env, provider) {
     const quote=row.quote_json?JSON.parse(row.quote_json):null;
     const quoteExpired=row.state==='currency_choice' && quote && Date.parse(quote.expiresAt)<=Date.now();
     const state=quoteExpired?'quote_expired':row.state==='open' && Date.parse(row.expires_at)<Date.now()?'expired':row.state;
-    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,currency:'BRL',dccEnabled,quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
+    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,bitcoinEnabled:bitcoin.enabled,bitcoinAmount:row.btc_sats || null,paymentMethod:row.payment_method,currency:'BRL',dccEnabled,quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,bitcoinTxid:row.btc_txid,bitcoinVout:row.btc_vout,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
   }
   function available(row) { return row && row.state==='open' && Date.parse(row.expires_at)>Date.now(); }
   app.post('/api/login',rateLimit({windowMs:15*60000,limit:10,skipSuccessfulRequests:true}), (req,res)=>{
@@ -79,7 +80,7 @@ export function createApp(env=process.env, provider) {
   app.get('/api/invoices',auth,(req,res)=>res.json({mode,invoices:db.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all().map(r=>exposed(r,true))}));
   app.post('/api/invoices',auth,(req,res)=>{
     try {
-      const {name,email='',description,amount,dueDate,requestKey,currency='BRL'}=req.body || {};
+      const {name,email='',description,amount,dueDate,requestKey,currency='BRL',bitcoinAmount=''}=req.body || {};
       if(currency!=='BRL') throw new Error('A cobrança é criada em BRL. A moeda do cartão é escolhida pelo doador após a oferta de conversão da Cielo.');
       if(!uuid.test(requestKey || '')) throw new Error('Identificador da solicitação inválido.');
       const existing=db.prepare('SELECT * FROM invoices WHERE request_key=?').get(requestKey);
@@ -90,13 +91,16 @@ export function createApp(env=process.env, provider) {
       if(typeof dueDate!=='string' || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || new Date(dueDate+'T12:00:00Z').toISOString().slice(0,10)!==dueDate) throw new Error('Data inválida.');
       const expires=new Date(dueDate+'T23:59:59-05:00');
       if(expires.getTime()<Date.now() || expires.getTime()>Date.now()+366*86400000) throw new Error('Escolha uma data entre hoje e um ano.');
+      const btc=bitcoinAmount?satoshis(bitcoinAmount):null;
+      if(btc && !bitcoin.enabled) throw new Error('Bitcoin não habilitado neste ambiente.');
       const id=randomBytes(24).toString('base64url');
-      db.prepare('INSERT INTO invoices(id,request_key,order_id,name,email,description,amount,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)').run(id,requestKey,randomBytes(12).toString('hex'),name.trim(),email.trim(),description.trim(),amountInCents(amount),expires.toISOString(),new Date().toISOString());
+      db.prepare('INSERT INTO invoices(id,request_key,order_id,name,email,description,amount,expires_at,created_at,btc_sats) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id,requestKey,randomBytes(12).toString('hex'),name.trim(),email.trim(),description.trim(),amountInCents(amount),expires.toISOString(),new Date().toISOString(),btc);
       res.status(201).json(exposed(getInvoice(id),true));
     } catch(e) {res.status(400).json({error:e.message});}
   });
   app.get('/api/public/:id',(req,res)=>{const row=getInvoice(req.params.id); if(!row)return res.status(404).json({error:'Cobrança não encontrada.'});res.json(exposed(row));});
   const payLimit=rateLimit({windowMs:15*60000,limit:20});
+  const bitcoin=installBitcoin(app,{db,env,mode,auth,exposed,getInvoice,available,payLimit,fetcher:bitcoinFetch});
   app.post('/api/public/:id/sop',payLimit,async(req,res)=>{
     if(!available(getInvoice(req.params.id))) return res.status(409).json({error:'Esta cobrança não está disponível para pagamento.'});
     if(mode==='demo') return res.json({demo:true});
@@ -164,6 +168,7 @@ export function createApp(env=process.env, provider) {
   app.post('/api/invoices/:id/refresh',auth,async(req,res)=>{
     const row=getInvoice(req.params.id);
     if(!row)return res.status(404).json({error:'Cobrança não encontrada.'});
+    if(row.payment_method==='bitcoin') return res.status(400).json({error:'Use Conferir Bitcoin. Este pagamento não passa pela Cielo.'});
     if(mode==='demo' || row.state==='open' || (row.state==='currency_choice' && Date.parse(JSON.parse(row.quote_json).expiresAt)>Date.now())) return res.json(exposed(row,true));
     if(row.state==='processing') return res.status(409).json({error:'Aguarde a conclusão do envio.'});
     try {

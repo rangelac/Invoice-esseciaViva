@@ -87,3 +87,27 @@ Fontes oficiais:
 - https://docs.cielo.com.br/ecommerce-cielo/reference/conversor-moedas-api
 - https://docs.cielo.com.br/ecommerce-cielo/reference/confirmar-conversao
 - https://docs.cielo.com.br/ecommerce-cielo/docs/fluxos-alternativos-conversao
+
+## Bitcoin (BTC na rede Bitcoin)
+
+É um meio independente da Cielo. Ao criar a cobrança, preencha opcionalmente `Valor alternativo em Bitcoin`. O valor BTC é fixado pela ONG, com até oito casas decimais; não há câmbio automático. O valor BRL continua como referência administrativa, inclusive nos totais (não significa liquidação bancária em reais).
+
+O endereço Bitcoin foi extraído do QR Code fornecido pelo proprietário e configurado apenas no `.env` local. O checksum é validado na inicialização. Não foram usados os outros dois QR Codes (USDT/Ethereum e Binance Pay), que não são endereços de Bitcoin. Não são necessárias nem aceitas chaves privadas ou frases de recuperação.
+
+- Demo: fluxo simulado, sem endereço real, QR Code ou link de carteira. Um TXID fictício pode ser usado para testar a conferência administrativa.
+- Produção: configure `BITCOIN_ADDRESS` (mainnet SegWit/Taproot) e `ENABLE_BITCOIN=true`, além dos requisitos gerais do ambiente. O endereço é copiado para a cobrança ao selecionar Bitcoin, mantendo o destino mesmo se a configuração mudar depois.
+- Selecionar Bitcoin reserva a cobrança para esse meio e bloqueia o cartão. Não há troca automática após emitir as instruções para evitar pagamento duplicado.
+- O QR Code contém endereço e valor em BTC. Não aceita USDT, Ethereum, Lightning nem Binance Pay.
+- O doador pode informar o TXID, mas isso só muda o estado para conferência; não declara a cobrança paga.
+- No painel, `Conferir Bitcoin` exige TXID, índice da saída (`vout`, a partir de zero) e confirmação de que o administrador identificou o doador. A consulta somente de leitura à API Esplora da Blockstream verifica endereço, valor mínimo, idade da transação e pelo menos três confirmações em um bloco na cadeia principal. A mesma saída não pode quitar duas cobranças.
+- Como o endereço é compartilhado, o TXID público sozinho não prova quem pagou; a associação ao doador é responsabilidade da ONG. Para automação completa e maior privacidade, uma evolução será usar um endereço exclusivo por cobrança via processador próprio de pagamentos Bitcoin.
+- A implementação verifica uma saída por cobrança, não soma pagamentos parciais. Excedentes são registrados em satoshis e devem ser conciliados pela ONG. Não faz envios, saques ou devoluções.
+- A verificação depende de um explorador externo, não é validação por nó próprio. Após a baixa não há monitoramento de reorganizações da rede nem atualização automática. Guarde e confira os comprovantes na carteira.
+
+Referências: https://github.com/Blockstream/esplora/blob/master/API.md e https://developer.bitcoin.org/devguide/payment_processing.html.
+
+## Débito — requisito ainda pendente
+
+Débito ainda não está implementado. Exige autenticação 3DS; não basta mudar `CreditCard` para `DebitCard`. A integração precisa das credenciais 3DS, do código do estabelecimento (EC), do nome cadastrado e do MCC para gerar o token, além da etapa de autenticação no navegador e validação do resultado na autorização. O número de usuário do portal não deve ser presumido como EC. O conversor de moedas não se aplica ao débito.
+
+Referências: https://docs.cielo.com.br/ecommerce-cielo/docs/cart%C3%A3o-de-debito e https://docs.cielo.com.br/ecommerce-cielo/v3.0-en/docs/create-access-token.
