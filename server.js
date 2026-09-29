@@ -7,6 +7,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cieloClient } from './cielo.js';
+import { readQuote, demoQuote } from './currency.js';
 const root = dirname(fileURLToPath(import.meta.url));
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function amountInCents(value) {
@@ -27,6 +28,10 @@ export function createApp(env=process.env, provider) {
   const secure=origin.startsWith('https://');
   if(mode==='production' && (!secure || env.ENABLE_LIVE_PAYMENTS!=='true')) throw new Error('Produção exige HTTPS e ENABLE_LIVE_PAYMENTS=true.');
   if(mode!=='demo') for(const key of ['CIELO_MERCHANT_ID','CIELO_MERCHANT_KEY','CIELO_SOP_CLIENT_ID','CIELO_SOP_CLIENT_SECRET']) if(!env[key]) throw new Error(`Configure ${key}.`);
+  const dccEnabled=mode==='demo' || env.CIELO_DCC_ENABLED==='true';
+  if(mode==='sandbox' && dccEnabled && !provider) throw new Error('DCC não é oferecido no sandbox Cielo. Use demo para simular.');
+  const markupPercent=Number(env.CIELO_DCC_MARKUP_PERCENT || 16);
+  if(!Number.isFinite(markupPercent) || markupPercent<0 || markupPercent>100) throw new Error('Markup DCC inválido.');
   const client=provider || cieloClient({...env,PAYMENT_MODE:mode});
   const file=env.DB_PATH || resolve(root,`data/${mode}.sqlite`);
   if(file!==':memory:') mkdirSync(dirname(file),{recursive:true});
@@ -34,6 +39,10 @@ export function createApp(env=process.env, provider) {
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, order_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, description TEXT NOT NULL, amount INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open', payment_id TEXT, checked_at TEXT);
   `);
+  const columns=db.prepare('PRAGMA table_info(invoices)').all().map(c=>c.name);
+  for(const [column,type] of Object.entries({dcc_requested:'INTEGER NOT NULL DEFAULT 0',dcc_started_at:'TEXT',quote_json:'TEXT',choice_currency:'TEXT',choice_at:'TEXT'})) {
+    if(!columns.includes(column)) db.exec(`ALTER TABLE invoices ADD COLUMN ${column} ${type}`);
+  }
   // A process restart must never unlock an attempt whose result is unknown.
   db.exec("UPDATE invoices SET state='review' WHERE state='processing'");
   const sessions=new Map();
@@ -52,8 +61,10 @@ export function createApp(env=process.env, provider) {
   }
   function getInvoice(id) { return db.prepare('SELECT * FROM invoices WHERE id=?').get(id); }
   function exposed(row,admin=false) {
-    const state=row.state==='open' && Date.parse(row.expires_at)<Date.now()?'expired':row.state;
-    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,...(admin?{name:row.name,email:row.email,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
+    const quote=row.quote_json?JSON.parse(row.quote_json):null;
+    const quoteExpired=row.state==='currency_choice' && quote && Date.parse(quote.expiresAt)<=Date.now();
+    const state=quoteExpired?'quote_expired':row.state==='open' && Date.parse(row.expires_at)<Date.now()?'expired':row.state;
+    return {id:row.id,description:row.description,amount:row.amount,expiresAt:row.expires_at,createdAt:row.created_at,state,mode,currency:'BRL',dccEnabled,quote,chosenCurrency:row.choice_currency,choiceAt:row.choice_at,...(admin?{name:row.name,email:row.email,orderId:row.order_id,checkedAt:row.checked_at,url:`${origin}/p/${row.id}`}:{})};
   }
   function available(row) { return row && row.state==='open' && Date.parse(row.expires_at)>Date.now(); }
   app.post('/api/login',rateLimit({windowMs:15*60000,limit:10,skipSuccessfulRequests:true}), (req,res)=>{
@@ -68,7 +79,8 @@ export function createApp(env=process.env, provider) {
   app.get('/api/invoices',auth,(req,res)=>res.json({mode,invoices:db.prepare('SELECT * FROM invoices ORDER BY created_at DESC').all().map(r=>exposed(r,true))}));
   app.post('/api/invoices',auth,(req,res)=>{
     try {
-      const {name,email='',description,amount,dueDate,requestKey}=req.body || {};
+      const {name,email='',description,amount,dueDate,requestKey,currency='BRL'}=req.body || {};
+      if(currency!=='BRL') throw new Error('A cobrança é criada em BRL. A moeda do cartão é escolhida pelo doador após a oferta de conversão da Cielo.');
       if(!uuid.test(requestKey || '')) throw new Error('Identificador da solicitação inválido.');
       const existing=db.prepare('SELECT * FROM invoices WHERE request_key=?').get(requestKey);
       if(existing) return res.json(exposed(existing,true));
@@ -90,22 +102,59 @@ export function createApp(env=process.env, provider) {
     if(mode==='demo') return res.json({demo:true});
     try {res.json(await client.sop());} catch {res.status(502).json({error:'Não foi possível preparar o cartão. Tente novamente mais tarde.'});}
   });
-  function savePayment(row,result) {
+  function savePayment(row,result,initial=false) {
     const payment=result?.Payment;
-    if(!payment || !uuid.test(payment.PaymentId || '') || result.MerchantOrderId!==row.order_id || payment.Amount!==row.amount || payment.Type!=='CreditCard') throw new Error('Resposta não conciliada.');
-    db.prepare('UPDATE invoices SET state=?,payment_id=?,checked_at=? WHERE id=?').run(paymentState(payment.Status),payment.PaymentId,new Date().toISOString(),row.id);
+    if(!payment || !uuid.test(payment.PaymentId || '') || result.MerchantOrderId!==row.order_id || payment.Amount!==row.amount || payment.Type!=='CreditCard' || (payment.Currency && payment.Currency!=='BRL')) throw new Error('Resposta não conciliada.');
+    if(initial && row.dcc_requested && payment.Status===12 && !row.choice_at) {
+      // Persist the provider ID before parsing so malformed quotes can still be reconciled.
+      db.prepare('UPDATE invoices SET payment_id=? WHERE id=?').run(payment.PaymentId,row.id);
+      const quote=readQuote(payment,row.amount,row.dcc_started_at,markupPercent);
+      db.prepare("UPDATE invoices SET state='currency_choice',quote_json=?,checked_at=? WHERE id=?").run(JSON.stringify(quote),new Date().toISOString(),row.id);
+      return;
+    }
+    // Some legacy DCC docs use 11 for ineligible cards; never mistake it for a refund.
+    const state=row.dcc_requested && !row.choice_at && payment.Status===11?'review':paymentState(payment.Status);
+    db.prepare('UPDATE invoices SET state=?,payment_id=?,checked_at=? WHERE id=?').run(state,payment.PaymentId,new Date().toISOString(),row.id);
   }
   app.post('/api/public/:id/pay',payLimit,async(req,res)=>{
     const row=getInvoice(req.params.id);
     if(!available(row)) return res.status(409).json({error:'Pagamento já enviado, vencido ou em conferência. Consulte o status antes de pagar novamente.'});
-    const {paymentToken,brand,demo} = req.body || {};
-    if(Object.keys(req.body || {}).some(k=>!['paymentToken','brand','demo'].includes(k)))return res.status(400).json({error:'Envie somente o token do cartão.'});
+    const {paymentToken,brand,demo,demoCurrency} = req.body || {};
+    if(Object.keys(req.body || {}).some(k=>!['paymentToken','brand','demo','demoCurrency'].includes(k)))return res.status(400).json({error:'Envie somente o token do cartão.'});
     if(mode==='demo' ? demo!==true : (!uuid.test(paymentToken || '') || !['Visa','Master','Elo','Amex','Diners','JCB','Discover','Hipercard'].includes(brand))) return res.status(400).json({error:'Dados do pagamento inválidos.'});
-    const locked=db.prepare("UPDATE invoices SET state='processing' WHERE id=? AND state='open'").run(row.id);
+    if(demoCurrency!==undefined && (mode!=='demo' || !['USD','EUR','GBP','JPY','KWD'].includes(demoCurrency))) return res.status(400).json({error:'Moeda de demonstração inválida.'});
+    const requestDcc=mode==='demo'?Boolean(demoCurrency):dccEnabled && ['Visa','Master'].includes(brand);
+    const startedAt=new Date().toISOString();
+    const locked=db.prepare("UPDATE invoices SET state='processing',dcc_requested=?,dcc_started_at=? WHERE id=? AND state='open'").run(requestDcc?1:0,requestDcc?startedAt:null,row.id);
     if(!locked.changes)return res.status(409).json({error:'Pagamento já em andamento.'});
     try {
+      const current=getInvoice(row.id);
+      if(mode==='demo' && demoCurrency) savePayment(current,{MerchantOrderId:row.order_id,Payment:{PaymentId:randomUUID(),Type:'CreditCard',Amount:row.amount,Status:12,CurrencyExchangeData:{CurrencyExchanges:[demoQuote(demoCurrency,row.amount)]}}},true);
+      else if(mode==='demo') db.prepare("UPDATE invoices SET state='paid',checked_at=? WHERE id=?").run(new Date().toISOString(),row.id);
+      else savePayment(current,await client.create(current,paymentToken,brand),true);
+      res.json(exposed(getInvoice(row.id)));
+    } catch {
+      db.prepare("UPDATE invoices SET state='review' WHERE id=?").run(row.id);
+      res.status(202).json(exposed(getInvoice(row.id)));
+    }
+  });
+  app.post('/api/public/:id/confirm-currency',payLimit,async(req,res)=>{
+    const row=getInvoice(req.params.id), currency=req.body?.currency;
+    if(!row || row.state!=='currency_choice') return res.status(409).json({error:'Esta conversão já foi enviada ou não está disponível.'});
+    const quote=JSON.parse(row.quote_json);
+    if(Date.parse(quote.expiresAt)<=Date.now()) return res.status(409).json({error:'A cotação expirou. Solicite à organização a conferência da cobrança.'});
+    if(Object.keys(req.body || {}).length!==1 || (currency!=='BRL' && !quote.exchanges.some(o=>o.currency===currency))) return res.status(400).json({error:'Escolha uma das moedas oferecidas pela Cielo.'});
+    const lock=db.prepare("UPDATE invoices SET state='processing',choice_currency=?,choice_at=? WHERE id=? AND state='currency_choice'").run(currency,new Date().toISOString(),row.id);
+    if(!lock.changes) return res.status(409).json({error:'Confirmação já em andamento.'});
+    try {
       if(mode==='demo') db.prepare("UPDATE invoices SET state='paid',checked_at=? WHERE id=?").run(new Date().toISOString(),row.id);
-      else savePayment(row,await client.create(row,paymentToken,brand));
+      else {
+        await client.confirm(row.payment_id,currency!=='BRL');
+        // Confirm responses lack order/amount. Independently query before marking paid.
+        const result=await client.query(row.payment_id);
+        if(result?.Payment?.PaymentId!==row.payment_id) throw new Error('Pagamento divergente.');
+        savePayment(getInvoice(row.id),result);
+      }
       res.json(exposed(getInvoice(row.id)));
     } catch {
       db.prepare("UPDATE invoices SET state='review' WHERE id=?").run(row.id);
@@ -115,7 +164,7 @@ export function createApp(env=process.env, provider) {
   app.post('/api/invoices/:id/refresh',auth,async(req,res)=>{
     const row=getInvoice(req.params.id);
     if(!row)return res.status(404).json({error:'Cobrança não encontrada.'});
-    if(mode==='demo' || row.state==='open') return res.json(exposed(row,true));
+    if(mode==='demo' || row.state==='open' || (row.state==='currency_choice' && Date.parse(JSON.parse(row.quote_json).expiresAt)>Date.now())) return res.json(exposed(row,true));
     if(row.state==='processing') return res.status(409).json({error:'Aguarde a conclusão do envio.'});
     try {
       let id=row.payment_id;
@@ -127,7 +176,8 @@ export function createApp(env=process.env, provider) {
       if(!uuid.test(id || ''))throw new Error('Pagamento não localizado.');
       const result=await client.query(id);
       if(result?.Payment?.PaymentId!==id)throw new Error('Pagamento divergente.');
-      savePayment(row,result);res.json(exposed(getInvoice(row.id),true));
+      if(getInvoice(row.id).state!==row.state) return res.status(409).json({error:'A situação mudou. Atualize a lista.'});
+      savePayment(row,result,Boolean(row.dcc_requested && !row.choice_at && !row.quote_json));res.json(exposed(getInvoice(row.id),true));
     } catch {res.status(502).json({error:'Não foi possível confirmar na Cielo. Mantenha a cobrança em conferência e verifique no painel Cielo antes de criar outra.'});}
   });
   app.use(express.static(resolve(root,'public'),{index:false}));

@@ -17,7 +17,12 @@ export function cieloClient(env, fetcher = fetch) {
       return {accessToken:token.AccessToken, environment:production?'production':'sandbox'};
     },
     create(invoice, paymentToken, brand) {
-      return call(`https://api${suffix}.cieloecommerce.cielo.com.br/v2/sales/`, {method:'POST',headers:headers(),body:JSON.stringify({MerchantOrderId:invoice.order_id, Customer:{Name:invoice.name}, Payment:{Type:'CreditCard',Amount:invoice.amount,Installments:1,Capture:true,SoftDescriptor:'ESSENCIAVIVA',CreditCard:{PaymentToken:paymentToken,Brand:brand}}})});
+      if(invoice.dcc_requested && !production) throw new Error("DCC requer o ambiente de produção da Cielo.");
+      return call(`https://api${suffix}.cieloecommerce.cielo.com.br/v2/sales/`, {method:'POST',headers:headers(),body:JSON.stringify({MerchantOrderId:invoice.order_id, Customer:{Name:invoice.name}, Payment:{Type:'CreditCard',Amount:invoice.amount,...(invoice.dcc_requested?{DynamicCurrencyConversion:true}:{}),Installments:1,Capture:true,SoftDescriptor:'ESSENCIAVIVA',CreditCard:{PaymentToken:paymentToken,Brand:brand}}})});
+    },
+    confirm(id, convert) {
+      if(!production) throw new Error('DCC requer o ambiente de produção da Cielo.');
+      return call(`https://api.cieloecommerce.cielo.com.br/1/sales/${encodeURIComponent(id)}/confirm`,{method:'PUT',headers:headers(),body:JSON.stringify({CurrencyConversion:convert})});
     },
     query(id) { return call(`https://apiquery${suffix}.cieloecommerce.cielo.com.br/1/sales/${encodeURIComponent(id)}`,{headers:headers()}); },
     find(order) { return call(`https://apiquery${suffix}.cieloecommerce.cielo.com.br/1/sales?merchantOrderId=${encodeURIComponent(order)}`,{headers:headers()}); }

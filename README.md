@@ -61,3 +61,29 @@ O e-mail é cadastrado, mas não há envio automático. A cobrança é um convit
 - https://github.com/Braspag/silent-order-post
 
 Referências consultadas em 28/09/2026.
+
+## Pagamento em outras moedas (DCC)
+
+O valor da cobrança e os totais da organização continuam em **BRL**. Para cartões estrangeiros elegíveis Visa/Mastercard à vista, a Cielo pode oferecer a moeda local do cartão (por exemplo USD, EUR ou GBP). O doador escolhe entre BRL e a oferta retornada; não é uma lista livre para cobrar arbitrariamente em qualquer moeda.
+
+- A página usa a moeda, o valor convertido e o câmbio retornados pela Cielo. Nenhuma cotação externa é usada em pagamentos reais.
+- Nenhuma opção vem pré-selecionada. A tela informa valor em BRL, valor estrangeiro, câmbio, markup e vencimento da oferta. O markup documentado pela Cielo na consulta é de 16%, configurável em `CIELO_DCC_MARKUP_PERCENT` e preservado junto à oferta.
+- A confirmação é enviada ao endpoint `/1/sales/{PaymentId}/confirm`, com `CurrencyConversion` verdadeiro para moeda estrangeira ou falso para BRL. Uma consulta independente confirma o resultado.
+- O prazo máximo de 20 minutos começa antes da requisição de cotação; não é renovado ao atualizar a página. Cotações expiradas e respostas incertas não geram uma segunda tentativa automática.
+- Moeda escolhida, cotação e horário de aceite persistem no banco. Um comprovante imprimível fica disponível na página após confirmação (simulações são identificadas).
+- A precisão monetária segue as casas decimais ISO da moeda. A aplicação recusa valores inconsistentes com o câmbio retornado, em vez de exibir uma conversão calculada por suposição. Valide o formato e a unidade do `ConvertedAmount` das moedas de sua conta na homologação.
+- O endpoint de confirmação documentado recebe somente um booleano. Respostas com mais de uma opção estrangeira são encaminhadas à conferência, pois não existe seleção documentada do código na confirmação.
+- Cartões inelegíveis com status 12 e sem oferta podem confirmar em BRL. Há documentação legada citando status 11 para inelegibilidade, em conflito com o status geral de estorno; esse caso fica em conferência até validação com a Cielo.
+
+### Ativar na conta real
+
+Configure `CIELO_DCC_ENABLED=true` **somente após validar com a Cielo a habilitação do conversor e sua combinação com Silent Order Post na conta**. A criação tokenizada permanece em `/v2/sales/` conforme a documentação do SOP; a documentação específica do DCC exemplifica `/1/sales` com cartão. A compatibilidade da combinação, os valores de retorno e os requisitos da bandeira precisam ser homologados com a Cielo; não foram verificados em produção nesta entrega. Não foi feita nenhuma cobrança real.
+
+Os endpoints de DCC consultados são documentados somente em produção. Por isso, a aplicação bloqueia ativar DCC no sandbox externo. Use o modo demo para revisar a experiência ou os testes com provedor simulado. O demo oferece exemplos USD, EUR, GBP, JPY e KWD com câmbio fictício; essa lista não limita as moedas reais retornadas pela Cielo.
+
+Fontes oficiais:
+- https://docs.cielo.com.br/ecommerce-cielo/docs/conversor-moedas-ecommerce
+- https://docs.cielo.com.br/ecommerce-cielo/reference/conversor-moedas-disponiveis
+- https://docs.cielo.com.br/ecommerce-cielo/reference/conversor-moedas-api
+- https://docs.cielo.com.br/ecommerce-cielo/reference/confirmar-conversao
+- https://docs.cielo.com.br/ecommerce-cielo/docs/fluxos-alternativos-conversao

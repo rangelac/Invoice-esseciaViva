@@ -9,7 +9,7 @@ async function load(){
 }
 function render(){
   $('#total-paid').textContent=money(invoices.filter(i=>i.state==='paid').reduce((n,i)=>n+i.amount,0));
-  $('#total-open').textContent=money(invoices.filter(i=>i.state==='open').reduce((n,i)=>n+i.amount,0));
+  $('#total-open').textContent=money(invoices.filter(i=>['open','currency_choice'].includes(i.state)).reduce((n,i)=>n+i.amount,0));
   $('#total-count').textContent=invoices.length;$('#list-count').textContent=invoices.length;
   $('#count-caption').textContent=invoices.length?`${invoices.filter(i=>i.state==='paid').length} contribuições confirmadas`:'Sua rede de apoio começa aqui';
   const search=$('#search').value.toLocaleLowerCase('pt-BR'), filter=$('#filter').value;
