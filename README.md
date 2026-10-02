@@ -4,7 +4,7 @@ Primeira versão com painel administrativo e página de pagamento por cartão de
 
 ## Executar localmente
 
-1. Instale Node.js 24 ou superior e Python 3.11 ou superior. Execute `npm ci` e `python -m pip install -r requirements.txt`. O gerador de PDF usa ReportLab. Se necessário, configure `PYTHON_BIN` com o caminho do Python no servidor.
+1. Instale Node.js 24 ou superior e execute `npm ci`. Os PDFs são gerados pelo Node.js, sem instalar Python.
 2. Copie `.env.example` para `.env`.
 3. Configure `ADMIN_PASSWORD` com uma senha exclusiva de pelo menos 16 caracteres.
 4. Execute `npm start` e abra http://localhost:3000.
@@ -124,7 +124,7 @@ O formulário permite escolher a moeda **antes de emitir a fatura**. O catálogo
 - O PDF administrativo contém os dados do destinatário. O download pelo link público omite nome, e-mail e endereço do doador, preservando a mesma separação de dados da API pública.
 - Nome, endereço e telefone institucionais foram extraídos do PDF de referência fornecido pelo usuário. Não foram copiados os dados do pagador nem o valor daquela fatura.
 - `PUBLIC_URL` define o destino do QR Code. Em localhost, o PDF avisa que o link só funciona na própria máquina. Para enviar a terceiros, publique em HTTPS e configure a URL pública antes de gerar o PDF.
-- PDFs são gerados sob demanda, sem gravar dados pessoais em arquivos de cache; no máximo três renderizações simultâneas, com tempo e tamanho limitados. O servidor usa Python com ReportLab via entrada padrão, sem interpolar dados em comandos.
+- PDFs são gerados sob demanda, sem gravar dados pessoais em arquivos de cache; no máximo três renderizações simultâneas, com tamanho limitado. O servidor usa PDFKit diretamente no Node.js, sem processos externos.
 - O comprovante de pagamento anterior e a fatura são documentos distintos: a fatura pode ser emitida antes do pagamento. Não é nota fiscal.
 
 O modelo visual foi conferido em PNG e o conteúdo do QR Code foi decodificado após renderizar o PDF. Testes cobrem valores EUR/JPY/KWD/BTC, conservação do equivalente BRL e acesso aos downloads.
@@ -147,7 +147,7 @@ Fonte: https://frankfurter.dev/
 
 `npm run check:production` lê `.env.production` e lista requisitos ausentes sem imprimir segredos ou efetuar transações. O arquivo é privado e ignorado pelo Git. A configuração local `.env` continua em demo até estarem disponíveis o domínio HTTPS e as credenciais SOP. Credenciais comerciais não substituem Client ID e Client Secret do SOP.
 
-A imagem do `Dockerfile` contém Node 24 e Python/ReportLab e executa como usuário sem privilégios. `.dockerignore` exclui credenciais, dados e artefatos locais. A imagem foi preparada, mas precisa ser construída e validada no ambiente de hospedagem; não houve publicação nesta entrega.
+A imagem do `Dockerfile` contém Node 24 e PDFKit e executa como usuário sem privilégios. `.dockerignore` exclui credenciais, dados e artefatos locais. A imagem foi preparada, mas precisa ser construída e validada no ambiente de hospedagem; não houve publicação nesta entrega.
 
 Para o responsável pela hospedagem:
 1. Configure os segredos na hospedagem, `PAYMENT_MODE=production`, `ENABLE_LIVE_PAYMENTS=true`, `PUBLIC_URL=https://seu-dominio` e as quatro credenciais Cielo/SOP.
@@ -157,3 +157,24 @@ Para o responsável pela hospedagem:
 5. Valide aprovação, recusa, timeout e conciliação no ambiente final. A verificação de configuração e os testes simulados não comprovam autorização de pagamentos reais.
 
 A atualização de pagamentos em conferência ainda é feita pelo botão **Consultar Cielo** no painel; não há webhook nem conciliação automática em segundo plano nesta versão.
+
+
+## Hospedagem Hostinger para essenciaviva.cartao.in
+
+A configuração de produção local foi atualizada para `https://essenciaviva.cartao.in`. Isso não publica o site nem instala o certificado: a associação ao aplicativo e o SSL devem ser concluídos no painel.
+
+O gerador ativo de PDF usa PDFKit no Node.js, sem Python, processos externos ou bibliotecas de sistema. O gerador anterior está preservado em `scripts/invoice_pdf.py` apenas para referência. Não é necessário instalar `requirements.txt` na hospedagem.
+
+Configuração do aplicativo:
+- Plano: Business ou Cloud com opção Node.js Web App (confirmar no painel).
+- Repositório: `https://github.com/rangelac/Invoice-esseciaViva`, branch `main`.
+- Framework Express, Node 24, raiz do repositório, entrada `server.js`.
+- Instalação `npm ci --omit=dev`; início `npm start`. Sem compilação do frontend; não publicar somente a pasta `public` como site estático.
+- `HOST=0.0.0.0`, porta conforme o ambiente da Hostinger e `PUBLIC_URL=https://essenciaviva.cartao.in`.
+- Importar os segredos diretamente nas variáveis de ambiente do painel. Não copiar `.env.production` para `public_html` nem enviar ao GitHub.
+
+**Banco de dados: pendência de instalação.** O sistema atual usa SQLite. O caminho de `DB_PATH` precisa ficar em armazenamento persistente privado, fora da pasta substituída nos deploys. Confirmar esse caminho e a política de backup com a Hostinger e testar reinício/redeploy sem perda. Se o plano não disponibilizar essa persistência, será necessário migrar para MySQL antes do uso real; a Hostinger oferece MySQL gerenciado. Não assumir que o banco dentro da pasta do código será preservado.
+
+A configuração de domínio, certificado e armazenamento ainda não foi validada no painel. O código não foi instalado nesta hospedagem. Não habilitar pagamentos reais enquanto faltarem Client ID/Secret SOP, persistência e validação da integração.
+
+Referências: https://www.hostinger.com/support/how-to-deploy-a-nodejs-website-in-hostinger/ e https://www.hostinger.com/support/connecting-a-hostinger-mysql-database-to-a-node-js-application/.
